@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>[arm64-hypervisor-tutorial 1] hello, world!</title>
+  <style>
+  img {
+    width: 500px;
+    height: auto;
+  }
+  </style>
+</head>
+<body>
+  <table><tr><th>Source:</th><td>https://ashw.io/blog/arm64-hypervisor-tutorial/1</td></tr></table>
+  <h1 id="introduction">Introduction</h1>
+  <p>Hello and welcome to my new tutorial series on writing a bare metal hypervisor for 64-bit Arm systems!</p><p>In
+ this series we will cover the fundamentals of virtualization in
+ the 64-bit Arm architecture and develop an accompanying
+hypervisor step-by-step, beginning with simple examples hosting
+ trivial virtual machines and working up to hosting fully-fledged
+operating system kernels such as Linux. Topics discussed will
+include device tree spoofing &amp; stage 2 address translations,
+CPU feature spoofing &amp; instruction emulation, device
+emulation, virtual interrupts, firmware interactions, and more.</p><p>The hypervisor code is being actively developed as an<a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial"> open source project on GitHub</a> and will be demoed throughout the series on the <a target="_blank" rel="noopener" href="https://developer.arm.com/products/system-design/fixed-virtual-platforms">Armv8-A Foundation Platform model</a> as shipped with the freely available <a target="_blank" rel="noopener" href="https://developer.arm.com/products/software-development-tools/ds-5-development-studio/editions/community-edition">DS-5 Community Edition</a>. Supplementary videos will also be hosted on <a target="_blank" rel="noopener" href="https://www.youtube.com/channel/UCjQh0UZyN0dMdRY-11SPnIw">my new YouTube channel</a>.</p><p>This
+ first post aims to introduce some key concepts and then kick-starts
+development with an example of how to boot a 64-bit Arm processor
+into a hypervisor and print “Hello, world!” over a PL011 UART
+serial console, all in A64 assembly.</p><h2>What is a hypervisor?</h2><p>First, take a step back and consider that the role of an operating system kernel is to:</p><ul data-rte-list="default"><li><p>provide layers of abstraction on top of the underlying hardware;</p></li><li><p>allocate
+ and schedule resources between multiple user-space
+applications, including execution time, memory, file I/O, and
+access to peripherals;</p></li></ul><p>In this way the kernel is said to supervise<em> </em>the
+ user-space applications running on top of it. A hypervisor does
+exactly the same thing, but instead of hosting multiple user-space
+applications it hosts multiple operating system kernels; it
+supervises the supervisor, hence the name <em>hypervisor</em>.</p><p>A
+ hypervisor creates virtual machines that behave as though they
+are real, physical machines; in certain use cases the operating
+system kernel controlling the virtual machine, referred to as a <em>guest</em>,
+ truly believes it has control of a real, physical machine and has
+no idea it is being virtualized. However this typically comes
+with a performance penalty so in other use cases the guest is made
+aware that it is being virtualized and can then cooperate with
+the hypervisor to reduce overhead; this is known as
+para-virtualization.</p><p>Typical applications of
+virtualization include sandboxing certain processes &amp; tasks
+or running a second operating system on a machine that is
+already running some other operating system, such as to test
+cross-platform software or to run a legacy application.
+Virtualization is a widely used tool and is the cornerstone of
+compute hosting services where one rents a virtual machine running
+ in the cloud (think: <a target="_blank" rel="noopener" href="https://aws.amazon.com/">Amazon Web Services</a> and <a target="_blank" rel="noopener" href="https://azure.microsoft.com/">Microsoft Azure</a>, to name but a few).</p><p>The industry defines two types of hypervisor, imaginatively named <em>Type 1</em> and <em>Type 2.</em></p><p>Type 1 hypervisors are also known as <em>bare metal</em>
+ hypervisors as they sit directly on the hardware with no
+underlying host operating system. In contrast, Type 2
+hypervisors are also known as <em>hosted</em> hypervisors as they
+either run on top of, or are themselves a part of, a host operating
+ system running on the hardware:</p>
+ <img src="images/type1_type2.png" alt="type1_type2" />
+ <p>A well-known open source Type 1 hypervisor is <a target="_blank" rel="noopener" href="https://www.xenproject.org/">Xen Project</a>, and for Type 2 hypervisors take a look at Linux’s built-in <a target="_blank" rel="noopener" href="https://www.linux-kvm.org/page/Main_Page">Kernel-based Virtual Machine (KVM)</a> solution. In this tutorial series we will be developing a Type 1 i.e. bare metal hypervisor.</p><h2>What exactly is a virtual machine?</h2><p>To
+ better understand this we should first take another look at
+operating system kernels, specifically the techniques they use to
+ supervise user-space applications. with one of the best examples
+ being virtual addressing.</p><p>Each time an application
+accesses a memory location, that access is made to a virtual
+address that is automatically translated to a physical address
+by the memory management unit (MMU) using page tables programmed
+by the kernel; these tables are also used to specify properties and
+ attributes such as access permissions and whether the processor
+can execute from the region.</p><p>The kernel can use the page
+tables to present a fake view of the system to user-space
+applications, such as by making each application believe it
+running at the bottom of memory and making non-contiguous blocks
+of physical memory appear as a single contiguous block to an
+application.</p><p>For example, if a system has 2GB DRAM starting at address 0x8000_0000 (something you may see often on Arm systems; see <a target="_blank" rel="noopener" href="http://infocenter.arm.com/help/topic/com.arm.doc.den0001c/DEN0001C_principles_of_arm_memory_maps.pdf">this white paper [PDF]</a>), then an application with a 64KB working set may have a view of memory that looks something like this:</p>
+<img src="images/s1mem.png" alt="s1mem" />
+<p>Note how the application has no idea where in physical
+memory it has actually been loaded, nor how much physical memory
+is actually available, nor that its <em>malloc</em>’d buffer is
+actually built up of non-contiguous blocks of physical memory;
+this is simply the view that is presented to the application, and
+it’s the kernel that has a view of the real, physical system.</p><p>At least, it <em>thinks</em> it does.</p><p>Enter
+ the hypervisor, which controls a second set of page tables in the
+ MMU, taking what the kernel thinks are physical addresses and
+translating them into real, physical addresses; the hypervisor
+can therefore present guest kernels with a view of the system that
+may not match the actual underlying hardware.</p><p>Expanding the figure above, the kernel <em>believes</em>
+ the system has 2GB DRAM starting at physical address 0x8000_0000,
+but there could actually be 16GB available starting at physical
+address<em> </em>0x10_0000_0000, and the 2GB visible to the kernel
+is simply a buffer that the hypervisor has allocated out of that
+16GB. Further, the kernel’s contiguous 2GB chunk of DRAM may
+actually comprise a number of non-contiguous blocks in the real,
+physical system’s memory, just like the application’s <em>malloc</em>’d buffer was in the kernel’s view of memory.</p>
+<img src="images/s2mem.png" alt="s2mem" />
+<p>Architecturally, the kernel controls <em>stage 1</em> translations mapping virtual addresses onto an <em>intermediate</em> physical address space, and the hypervisor controls <em>stage 2</em> translations mapping these intermediate physical addresses onto the real, physical address space.</p><p>There
+ are other tools available to the hypervisor, including trapping
+instructions and system register accesses, having visibility
+of physical interrupts before the guest (termed <em>routing</em>),
+ injecting virtual interrupts into the guest, and more. These are
+used in conjunction with stage 2 translations to construct a <em>virtual</em> machine that a guest operating system kernel controls as though it is a real, physical machine. </p><p>Further,
+ just like how an operating system kernel is able to context
+switch between multiple user-space applications, a hypervisor
+is able to context switch between multiple operating system
+kernels. Technically, the hypervisor schedules <em>virtual cores</em>
+ on real, physical cores, and a single virtual machine may
+comprise many virtual cores; this also means we are able to run SMP
+operating systems on virtual machines.</p><h2>Getting started</h2><p>The 64-bit Arm architecture defines the following levels of privilege:</p><ul data-rte-list="default"><li><p>EL0 for user-space applications;</p></li><li><p>EL1 for operating system kernels;</p></li><li><p>EL2 for the hypervisor;</p></li><li><p>EL3 for firmware, which also acts as gatekeeper to the <em>Secure</em> world (TrustZone);</p></li></ul><p>Note: <em>EL</em> is short for <em>Exception Level</em>.</p><p>While
+ this tutorial series primarily focuses on the interactions
+between EL1 and EL2, note that an Arm processor will always reset
+into the highest implemented exception level i.e. EL3 on the
+Armv8-A Foundation Model. This is important because the
+architecture only guarantees a bare minimum known safe state at
+reset:</p><ul data-rte-list="default"><li><p>the MMU and caches are disabled at the highest implemented exception level;</p></li><li><p>all asynchronous exceptions are masked at the highest implemented exception level;</p></li></ul><p>And
+ that’s pretty much it; most other system registers have
+architecturally UNKNOWN values at reset. This means we do not know:</p><ul data-rte-list="default"><li><p>whether EL2’s MMU and caches are enabled or disabled;</p></li><li><p>whether EL2 is 32-bit or 64-bit;</p></li><li><p>whether EL2 and below are Secure or Non-secure;</p></li></ul><p>We
+ will therefore need to configure these elements of the processor
+context before actually dropping to EL2, otherwise we risk
+performing an illegal exception return or immediately taking
+an MMU abort when trying to fetch the first instruction at the
+hypervisor entry point; given that EL2’s vector base address
+register <em>VBAR_EL2 </em>also has an UNKNOWN reset value, this MMU
+abort would likely throw us into a recursive exception upon trying
+to fetch the first instruction of the synchronous exception
+handler.</p><p>The <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/source/entry3.S"><em>entry3.S </em>file</a> shows how to perform this configuration before passing control to the hypervisor in EL2:</p><pre class="pre"><span class="pre_padding">    <span>globalfunc</span> <span>entry3</span>
+        <span>// Install dummy vector table; each entry branches-to-self</span>
+        <span>ADRP</span>    <span>x0</span>, <span>dummy_vectors</span>
+        <span>MSR</span>     <span>VBAR_EL3</span>, <span>x0</span>
+
+        <span>//</span>
+        <span>// Configure SCR_EL3</span>
+        <span>//</span>
+        <span>//   10:10 RW       x1      make EL2 be 64-bit</span>
+        <span>//   08:08 HCE      x1      enable HVC instructions</span>
+        <span>//   05:04 RES1     x3      reserved</span>
+        <span>//   00:00 NS       x1      switch to Normal world</span>
+        <span>//</span>
+        <span>MOV</span>     <span>w0</span>, <span>#0x531</span>
+        <span>MSR</span>     <span>SCR_EL3</span>, <span>x0</span>
+
+        <span>//</span>
+        <span>// Configure SCTLR_EL2</span>
+        <span>//</span>
+        <span>//   29:28 RES1     x3      reserved</span>
+        <span>//   23:22 RES1     x3      reserved</span>
+        <span>//   18:18 RES1     x1      reserved</span>
+        <span>//   16:16 RES1     x1      reserved</span>
+        <span>//   12:12 I        x0      disable allocation of instrs into unified $s</span>
+        <span>//   11:11 RES1     x1      reserved</span>
+        <span>//   05:04 RES1     x3      reserved</span>
+        <span>//   02:02 C        x0      disable allocation of data into data/unified $s</span>
+        <span>//   00:00 M        x0      disable MMU</span>
+        <span>//</span>
+        <span>LDR</span>     <span>w0</span>, <span>=</span><span>0x30C50830</span>
+        <span>MSR</span>     <span>SCTLR_EL2</span>, <span>x0</span>
+
+        <span>//</span>
+        <span>// Prepare to drop to EL2h with all asynchronous exceptions masked</span>
+        <span>//</span>
+        <span>//   09:09 D        x1      Mask debug exceptions</span>
+        <span>//   08:08 A        x1      Mask SErrors</span>
+        <span>//   07:07 I        x1      Mask IRQs</span>
+        <span>//   06:06 F        x1      Mask FIQs</span>
+        <span>//   04:04 M[4]     x0      Bits 03:00 define an AArch64 state</span>
+        <span>//   03:00 M[3:0]   x9      EL2h</span>
+        <span>//</span>
+        <span>MOV</span>     <span>w0</span>, <span>#0x3C9</span>
+        <span>MSR</span>     <span>SPSR_EL3</span>, <span>x0</span>
+
+        <span>// Drop to hypervisor code</span>
+        <span>ADR</span>     <span>x0</span>, <span>entry2</span>
+        <span>MSR</span>     <span>ELR_EL3</span>, <span>x0</span>
+        <span>ERET</span>
+    <span>endfunc</span> <span>entry3</span></span></pre><p>The <em>globalfunc</em> and <em>endfunc</em> here are convenience macros defined in <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/include/asm.h"><em>asm.h</em></a><em> </em>that together:</p><ul data-rte-list="default"><li><p>place the function in its own executable section;</p></li><li><p>define a symbol at the start of that section, marked as a function;</p></li><li><p>export the symbol to have global scope;</p></li><li><p>insert debugging info into the assembled binary, including function start, function end, and symbol size;</p></li></ul><h2>Vectors and exceptions</h2><p>You’ll also notice we installed <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/source/vectors.S">a dummy vector table</a>
+ at EL3. In the 64-bit Arm architecture, each entry in the vector
+table is 32 instructions long and the entry that is branched to is
+determined by both the type of the exception and from where the
+exception was taken:</p>
+<img src="images/vectors.png" alt="vectors" />
+<p>Regarding
+ the green and blue blocks, the architecture gives EL1, EL2, and EL3
+the ability to switch between two stack pointers: <em>SP_EL0</em> and <em>SP_ELx</em> e.g. SP_EL2 for EL2. Privileged software uses this to switch between <em>thread</em> mode (SP_EL0) and <em>handler</em>
+ mode (SP_ELx). Note that when privileged software is in thread mode
+i.e. using SP_EL0, it’s not actually using the user-space stack;
+rather, the user-space stack pointer will have been saved off as part of
+ the application’s context and the register value overwritten
+with the privileged software’s thread mode stack pointer.</p>
+
+  <blockquote data-animation-role="quote">
+    <span></span>What would happen if the vector table did not
+differentiate between exceptions taken using SP_EL0 and
+exceptions taken using SP_ELx, and privileged software then took a
+ stack overflow?<span></span>
+  </blockquote>
+  — Exercise for the reader
+
+<p>The yellow and pink blocks are used to determine how much
+effort needs to be expended in context switching out the less
+privileged software. Note in the yellow block we say “<em>one or more lower levels are 64-bit”</em>; this is strictly different to saying that we came <em>from</em> a 64-bit level.</p><p>Consider
+ a 64-bit hypervisor at EL2 hosting a 64-bit guest kernel at EL1,
+which is in turn hosting a 32-bit user-space application at EL0.
+Let’s say we are currently running in the application code and take
+ a hypervisor scheduler tick interrupt to EL2; we’ll need to
+perform a full 64-bit context switch even though we came from a 32-bit
+ context, so in this example we’d have taken the exception to the
+yellow vector block. In contrast, if the guest kernel itself was
+32-bit then we’d have taken the exception to the pink vector block.</p><p>We
+ refer to the vector table installed here as a “dummy” because each
+ entry is just a branch-to-self instruction; this is useful early on
+ in development before we have written a proper vector table, and
+ for early on in the boot process before we are actually ready to
+handle exceptions. Even though we’re not going to be doing
+anything in EL3, it’s good practice to install a dummy vector table
+ so that any exceptions result in safely spinning and we can use a
+debugger to read out the syndrome registers to figure out what
+went wrong; otherwise we’d instead get thrown into a recursive
+exception and the syndrome register will be trampled.</p><h2>Hello, world!</h2><p>The hypervisor entry point in EL2 is defined in <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/source/entry2.S"><em>entry2.S</em></a>:</p>
+<pre class="pre"><span class="pre_padding">    .<span>data</span>
+    <span>hello_world</span>:
+        .<span>ascii</span> <span>"Hello, world!\0"</span>
+
+
+    <span>globalfunc</span> <span>entry2</span>
+        <span>ADRP</span>    <span>x0</span>, <span>dummy_vectors</span>
+        <span>MSR</span>     <span>VBAR_EL2</span>, <span>x0</span>
+        <span>ADRP</span>    <span>x0</span>, <span>_stack_start</span>
+        <span>MOV</span>     <span>sp</span>, <span>x0</span>
+        <span>BL</span>      <span>pl011_init</span>
+        <span>ADR</span>     <span>x0</span>, <span>hello_world</span>
+        <span>BL</span>      <span>pl011_puts</span>
+        <span>B</span>       .
+    <span>endfunc</span> <span>entry2</span></span></pre>
+<p>Here
+ we also install another dummy vector table, initialise the stack
+pointer, enable the model’s PL011 UART, then print “Hello, world!” over
+ it.</p><p>The PL011 driver functions are in <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/source/pl011.S"><em>pl011.S</em></a>, and the keen-eyed among you may notice that <em>pl011_init()</em>
+ doesn’t do a full initialisation; this is because the UART is not
+fully modelled on the Armv8-A Foundation Platform and is instead
+piped in/out over a local Telnet connection, so we don’t need to
+worry about setting the word length or baud rate and can instead just
+clear any flags and enable the UART:</p><pre class="pre"><span class="pre_padding">    <span>/*</span>
+<span>    * Initialise the PL011 UART with Tx and Rx enabled.</span>
+<span>    */</span>
+    <span>globalfunc</span> <span>pl011_init</span>
+        <span>LDR</span>     <span>x0</span>, <span>=</span><span>PLATFORM_PL011_BASE</span>
+        <span>STR</span>     <span>wzr</span>, [<span>x0</span>, <span>#CR]</span>
+        <span>STR</span>     <span>wzr</span>, [<span>x0</span>, <span>#ECR]</span>
+        <span>STR</span>     <span>wzr</span>, [<span>x0</span>, <span>#DR]</span>
+        <span>LDR</span>     <span>w1</span>, <span>=</span><span>0x301</span>
+        <span>STR</span>     <span>w1</span>, [<span>x0</span>, <span>#CR]</span>
+        <span>RET</span>
+    <span>endfunc</span> <span>pl011_init</span></span></pre><p><em>PLATFORM_PL011_BASE</em> is defined as 0x1C09_0000 in <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/include/platform.h"><em>platform.h</em></a>, matching the base address of the PL011 UART on the Armv8-A Foundation Model; you can find the full system memory map <a target="_blank" rel="noopener" href="https://developer.arm.com/products/system-design/fixed-virtual-platforms/docs/dui0677/d/programmers-reference/armv8-a-foundation-model-memory-map">here</a>.</p><p>We
+ use simple polled I/O to print a single ASCII character over the
+PL011 UART, and if the character is a newline ‘\n’ then we first
+print ‘\r’:</p><pre class="pre"><span class="pre_padding">    <span>globalfunc</span> <span>pl011_putc</span>
+        <span>LDR</span>     <span>x1</span>, <span>=</span><span>PLATFORM_PL011_BASE</span>
+        .<span>macro</span> <span>wait_for_tx_ready</span>
+            <span>1</span>:
+                <span>LDR</span>     <span>w2</span>, [<span>x1</span>, <span>#FR]</span>
+                <span>MOV</span>     <span>w3</span>, <span>#(FR_TXFF | FR_BUSY)</span>
+                <span>AND</span>     <span>w2</span>, <span>w2</span>, <span>w3</span>
+                <span>CBNZ</span>    <span>w2</span>, <span>1</span><span>b</span>
+        .<span>endm</span>
+        <span>wait_for_tx_ready</span>
+        <span>CMP</span>     <span>w0</span>, <span>#ASCII_NL</span>
+        <span>B</span>.<span>NE</span>    <span>2</span><span>f</span>
+        <span>MOV</span>     <span>w2</span>, <span>#ASCII_CR</span>
+        <span>STR</span>     <span>w2</span>, [<span>x1</span>, <span>#DR]</span>
+        <span>wait_for_tx_ready</span>
+    <span>2</span>:
+        <span>STR</span>     <span>w0</span>, [<span>x1</span>, <span>#DR]</span>
+        <span>RET</span>
+    <span>endfunc</span> <span>pl011_putc</span></span></pre><p>Note that this function is not thread-safe, but that’s OK at this stage.</p><p>The GNU gas assembly syntax allows for special reusable numeric labels that can be referenced using <em>b</em> for first occurrence searching backwards or <em>f</em> for first occurrence searching forwards; for example, <em>CBNZ w2, 1b</em> means “conditionally branch backwards to the closest <em>1</em> label if <em>w2</em> is non-zero”, while <em>B.NE 2f</em> means “conditionally branch forwards to closest <em>2</em> label if the ALU flags condition code NE (Not Equal) is true”.</p><p>To print an ASCII string we simply print each individual character using <em>pl011_putc()</em> until reaching a null character:</p><pre class="pre"><span class="pre_padding">    <span>globalfunc</span> <span>pl011_puts</span>
+        <span>push</span>    <span>x20</span>, <span>x30</span>
+        <span>MOV</span>     <span>x20</span>, <span>x0</span>
+    <span>1</span>:
+        <span>LDRB</span>    <span>w0</span>, [<span>x20</span>], <span>#1</span>
+        <span>CBZ</span>     <span>w0</span>, <span>2</span><span>f</span>
+        <span>BL</span>      <span>pl011_putc</span>
+        <span>B</span>       <span>1</span><span>b</span>
+    <span>2</span>:
+        <span>pop</span>     <span>x20</span>, <span>x30</span>
+        <span>RET</span>
+    <span>endfunc</span> <span>pl011_puts</span></span></pre><p>Note the use of <em>push</em> and <em>pop</em> here, which are convenience macros defined in <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/include/asm.h"><em>asm.h</em></a> like <em>globalfunc</em> and <em>endfunc</em>; while previous versions of the Arm architecture had native <em>PUSH</em> and <em>POP</em> instructions based on <em>LDM</em> and <em>STM</em>
+ (Load/Store Multiple), these instructions were removed in 64-bit
+Armv8-A and need to be constructed manually using regular loads
+and stores, or the new <em>LDP</em> and <em>STP</em> (Load/Store Pair) instructions:</p><pre class="pre"><span class="pre_padding">    <span>/* Stack 1-2 registers. */</span>
+    .<span>macro</span> <span>push</span> <span>reg1</span>:<span>req</span>, <span>reg2</span>:<span>vararg</span>
+        .<span>ifnb</span> <span>reg2</span>
+            <span>STP</span>     \<span>reg1</span>, \<span>reg2</span>, [<span>sp</span>, <span>#-16]!</span>
+        .<span>else</span>
+            <span>STP</span>     \<span>reg1</span>, <span>xzr</span>, [<span>sp</span>, <span>#-16]!</span>
+        .<span>endif</span>
+    .<span>endm</span>
+
+
+    <span>/* Pop 1-2 registers. */</span>
+    .<span>macro</span> <span>pop</span> <span>reg1</span>:<span>req</span>, <span>reg2</span>:<span>vararg</span>
+        .<span>ifnb</span> <span>reg2</span>
+            <span>LDP</span>     \<span>reg1</span>, \<span>reg2</span>, [<span>sp</span>], <span>#16</span>
+        .<span>else</span>
+            <span>LDP</span>     \<span>reg1</span>, <span>xzr</span>, [<span>sp</span>], <span>#16</span>
+        .<span>endif</span>
+    .<span>endm</span></span></pre><p>These
+macros ensure the stack pointer is kept 16-byte aligned even if less
+than 16 bytes are being pushed onto the stack; this is a requirement
+of the <a target="_blank" rel="noopener" href="https://developer.arm.com/docs/ihi0055/b">64-bit Arm Procedure Call Standard [PDF]</a>.</p><p>That same document defines register conventions such as <em>x30</em>
+ being the link register, as well as which registers must be
+preserved between function calls and which can be trampled over by
+the callee. In the case of <em>pl011_puts()</em> we need to preserve the pointer to the next ASCII character between calls to <em>pl011_putc()</em>, so we put it in callee-saved register <em>x20</em>. However, the code that called <em>pl011_puts()</em> may itself have put something in <em>x20</em>
+ that it needs preserving, hence we stack it then restore it before
+returning at the end of the function. We also need to stack <em>x30</em> as our return address will be trampled by the calls to <em>pl011_putc()</em>.</p><h2>Link time</h2><p>In the hypervisor entry point function, <em>entry2</em>, we initialised the stack pointer to the address of <em>_stack_start</em>; this symbol is exported by the <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial/blob/part-01/linker.ld"><em>linker.ld</em></a> script:</p><pre class="pre"><span class="pre_padding">    <span>ENTRY</span>(<span>entry3</span>)
+
+    <span>SECTIONS</span>
+    {
+        . <span>=</span> <span>0x80000000</span>;
+
+        .<span>stack</span> (<span>NOLOAD</span>): {
+            . <span>=</span> <span>ALIGN</span>(<span>16</span>);
+            <span>_stack_end</span> <span>=</span> .;
+            . <span>=</span> . <span>+</span> (<span>16</span> <span>*</span> <span>1024</span>);
+            . <span>=</span> <span>ALIGN</span>(<span>16</span>);
+            <span>_stack_start</span> <span>=</span> .;
+        }
+
+        .<span>text</span> : {
+            <span>out</span><span>/</span><span>entry3</span>.<span>o</span>(.<span>text</span>);
+            <span>out</span><span>/</span><span>entry2</span>.<span>o</span>(.<span>text</span>);
+            <span>*</span>(.<span>text</span>);
+        }
+
+        .<span>data</span> : { <span>*</span>(.<span>data</span>) }
+        .<span>bss</span>  : { <span>*</span>(.<span>bss</span>) }
+    }</span></pre><p>The stack is always <em>full descending</em> in the 64-bit Arm architecture:</p><ul data-rte-list="default"><li><p>“full”,
+ meaning the stack pointer points to the most recently pushed item,
+unlike an “empty” stack where it points to the next empty address;</p></li><li><p>“descending”,
+ meaning the stack pointer is decremented when pushing an item,
+unlike an “ascending” stack where it is incremented;</p></li></ul><p>DRAM begins at 0x8000_0000 on the model, so for now we place a single 16KB stack there, followed by the traditional <em>text</em>, <em>data</em>, and <em>bss </em>sections.</p><p>You’ll notice that the linker script also defines <em>entry3</em> as the image entry point, corresponding to the minimal setup code in EL3.</p><h2>Building the hypervisor</h2><p>The hypervisor source code is available as an <a target="_blank" rel="noopener" href="https://github.com/ashwio/arm64-hypervisor-tutorial">open source project on GitHub</a>, with the <em>part-01</em> tag corresponding to the examples shown in this particular article.</p><p>To build the project we will use the bare metal (aarch64-elf) Linaro GCC 6.1-2016.08 cross compiler, available <a target="_blank" rel="noopener" href="http://releases.linaro.org/components/toolchain/binaries/6.1-2016.08/aarch64-elf/">here</a>.</p><pre class="pre"><span class="pre_padding">    <span># Build project</span>
+    <span>$</span> <span>make</span> <span>all</span> <span>CROSS_COMPILE</span><span>=</span><span>"/path/to/aarch64-elf-gcc/bin/aarch64-elf-"</span>
+
+    <span># Clean project</span>
+    <span>$</span> <span>make</span> <span>clean</span> <span>CROSS_COMPILE</span><span>=</span><span>"/path/to/aarch64-elf-gcc/bin/aarch64-elf-"</span>
+
+    <span># Clean then build project</span>
+    <span>$</span> <span>make</span> <span>rebuild</span> <span>CROSS_COMPILE</span><span>=</span><span>"/path/to/aarch64-elf-gcc/bin/aarch64-elf-"</span>
+
+    <span># You can also export CROSS_COMPILE to not have to pass it to make</span>
+    <span>$</span> <span>export</span> <span>CROSS_COMPILE</span><span>=</span><span>"/path/to/aarch64-elf-gcc/bin/aarch64-elf-"</span></span></pre><h2>Running the hypervisor</h2><p>Throughout this series we will use the freely available <a target="_blank" rel="noopener" href="https://developer.arm.com/products/software-development-tools/ds-5-development-studio/editions/community-edition">Arm DS-5 Community Edition</a>, which ships with the Armv8-A Foundation Model. This is a <em>Fixed Virtual Platform</em> (FVP) that allows us to easily run and debug our hypervisor code in real-time (<em>you can even follow the instructions </em><a target="_blank" rel="noopener" href="https://community.arm.com/dev-platforms/w/docs/304/arm-reference-platforms-deliverables"><em>here</em></a><em>
+ to fetch, build, and run a fully-integrated software stack on the
+model, comprising firmware, boot loader, Linux kernel, and user-space
+ filesystem. Disclaimer: I maintain these pages and the
+corresponding workspace initialisation script in my role as an
+Applications Engineer at Arm</em>).</p><p>We will use the Eclipse
+for DS-5 Debugger to launch the model, load the hypervisor, then
+step through the code. First launch Arm DS-5 Community Edition, then
+switch to the <em>DS-5 Debug</em> perspective:</p>
+<img src="images/debug.png" alt="debug" /><p>Navigate to <em>Run &gt; Debug Configurations…</em> then select <em>DS-5 Debugger</em> and click <em>New launch configuration</em>.</p><ul data-rte-list="default"><li><p>On the <em>Connection</em> tab, select <em>ARM Model &gt; ARMv8-Ax1 Foundation Platform &gt; Bare Metal Debug  &gt; Debug ARMv8-A</em></p></li><li><p>On the <em>Files</em> tab, in <em>Application on host to download</em>, navigate to the <em>out.elf</em> generated when you built the project, and ensure <em>Load symbols</em> is ticked</p></li><li><p>On the <em>Debugger</em> tab, select <em>Debug from symbol</em> and type <em>entry3</em> into the box</p></li></ul><p>While still on the <em>Debugger</em> tab, also tick <em>Execute debugger commands</em> then paste the following into the box, replacing <em>/path/to/out.elf</em> with the same path that you entered on the <em>Files</em> tab:</p><pre class="pre"><span class="pre_padding">    <span>file</span> <span>"/path/to/out.elf"</span> <span>EL2N</span>:<span>0x0</span>
+    <span>delete</span> <span>breakpoints</span>
+    <span>hb</span> <span>EL2N</span>:<span>entry2</span>
+    <span>continue</span></span></pre><p>These
+ commands let us skip over the minimal setup code in EL3 and begin
+stepping through the code from the hypervisor entry point in EL2.</p><p>For reference, the screenshots below show the debug configuration that I created on my own machine:</p>
+<img src="images/connection.png" alt="connection" />
+<img src="images/files.png" alt="files" />
+<img src="images/debugger.png" alt="debugger" />
+<p>Before launching the model, make sure you have enabled the <em>Telnet Client</em> feature if running on Windows or have installed <em>xterm</em> if running on Linux.</p>
+<img src="images/telnet.png" alt="telnet" /><p>You can now launch the model and will be paused at the hypervisor entry point in EL2:</p>
+<img src="images/dbg_entry.png" alt="dbg_entry" /><p>Resuming execution will open a <em>Telnet</em> or <em>xterm</em> window and print “Hello, world!”:</p>
+<img src="images/hello_windows.png" alt="hello_windows" />
+<img src="images/hello_linux.png" alt="hello_linux" />
+<p>Thanks for reading, watch this space for part 2 of the tutorial series, coming soon!</p>
+</body>
+</html>
